@@ -1,0 +1,28 @@
+version: "3.8"
+
+services:
+  spark-master:
+    build: .
+    container_name: spark-master
+    command: tail -f /dev/null
+    environment:
+      - PYTHONPATH=/app
+    volumes:
+      - ./data:/app/data
+      - ./src:/app/src
+      - ./tests:/app/tests
+      - ./run_pipeline.py:/app/run_pipeline.py
+      - ./requirements.txt:/app/requirements.txt
+
+  spark-worker:
+    build: .
+    container_name: spark-worker
+    command: tail -f /dev/null
+    environment:
+      - PYTHONPATH=/app
+    depends_on:
+      - spark-master
+    volumes:
+      - ./data:/app/data
+      - ./src:/app/src
+      - ./tests:/app/tests
