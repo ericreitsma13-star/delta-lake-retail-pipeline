@@ -95,6 +95,7 @@ class TestIncrementalLoad:
         silver_path = str(tmp_path / "silver")
         region_path = str(tmp_path / "gold" / "region")
         category_path = str(tmp_path / "gold" / "category")
+        staging_path = str(tmp_path / "staging")  # isolated — avoids live staging table
 
         # ── source data ────────────────────────────────────────────────────
         batch1_rows = [
@@ -115,7 +116,7 @@ class TestIncrementalLoad:
         # ══════════════════════════════════════════════════════════════════
         # LOAD 1
         # ══════════════════════════════════════════════════════════════════
-        rows_b1 = ingest_bronze(spark, source_path=batch1_src, output_path=bronze_path)
+        rows_b1 = ingest_bronze(spark, source_path=batch1_src, output_path=bronze_path, staging_path=staging_path)
         assert rows_b1 == 4, "bronze: load 1 should ingest 4 rows"
 
         stats1 = transform_silver(spark, bronze_path=bronze_path, silver_path=silver_path)
@@ -152,7 +153,7 @@ class TestIncrementalLoad:
         # ══════════════════════════════════════════════════════════════════
         # LOAD 2 — new transactions on a different date
         # ══════════════════════════════════════════════════════════════════
-        rows_b2 = ingest_bronze(spark, source_path=batch2_src, output_path=bronze_path)
+        rows_b2 = ingest_bronze(spark, source_path=batch2_src, output_path=bronze_path, staging_path=staging_path)
         assert rows_b2 == 3, "bronze: load 2 should ingest 3 rows"
 
         stats2 = transform_silver(spark, bronze_path=bronze_path, silver_path=silver_path)
@@ -197,7 +198,7 @@ class TestIncrementalLoad:
         # ══════════════════════════════════════════════════════════════════
         # RE-RUN LOAD 2 — idempotency check
         # ══════════════════════════════════════════════════════════════════
-        ingest_bronze(spark, source_path=batch2_src, output_path=bronze_path)
+        ingest_bronze(spark, source_path=batch2_src, output_path=bronze_path, staging_path=staging_path)
 
         stats3 = transform_silver(spark, bronze_path=bronze_path, silver_path=silver_path)
 

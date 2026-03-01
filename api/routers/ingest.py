@@ -5,11 +5,12 @@ from __future__ import annotations
 from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException
-from pyspark.sql import Row, SparkSession
+from pyspark.sql import SparkSession
 
 import src.config as config
 from api.dependencies import get_spark
 from api.models.schemas import IngestResponse, TransactionIn
+from src.utils.schema_utils import SOURCE_SCHEMA
 
 router = APIRouter(prefix="/ingest", tags=["ingest"])
 
@@ -35,25 +36,27 @@ def ingest_transaction(
     """
     staged_at = datetime.now(timezone.utc).isoformat()
 
-    row = Row(
-        transaction_id=payload.transaction_id,
-        event_date=payload.event_date.isoformat(),
-        store_id=payload.store_id,
-        region=payload.region,
-        customer_id=payload.customer_id,
-        product_id=payload.product_id,
-        product_name=payload.product_name,
-        category=payload.category,
-        quantity=payload.quantity,
-        unit_price=float(payload.unit_price),
-        discount_pct=payload.discount_pct,
-        discount_amount=float(payload.discount_amount),
-        total_amount=float(payload.total_amount),
-        payment_method=payload.payment_method,
-    )
+    # Build a tuple in SOURCE_SCHEMA field order to guarantee type alignment
+    # (avoids Row(**kwargs) alphabetical-sort + LongType vs IntegerType mismatches)
+    data = [(
+        payload.transaction_id,
+        payload.event_date.isoformat(),  # event_date is StringType in SOURCE_SCHEMA
+        payload.store_id,
+        payload.region,
+        payload.customer_id,
+        payload.product_id,
+        payload.product_name,
+        payload.category,
+        int(payload.quantity),
+        float(payload.unit_price),
+        int(payload.discount_pct),
+        float(payload.discount_amount),
+        float(payload.total_amount),
+        payload.payment_method,
+    )]
 
     try:
-        df = spark.createDataFrame([row])
+        df = spark.createDataFrame(data, schema=SOURCE_SCHEMA)
         (
             df.write.format("delta")
             .mode("append")
