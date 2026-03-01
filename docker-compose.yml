@@ -26,3 +26,26 @@ services:
       - ./data:/app/data
       - ./src:/app/src
       - ./tests:/app/tests
+
+  iceberg-rest:
+    image: tabulario/iceberg-rest:latest
+    container_name: iceberg-rest
+    ports:
+      - "8181:8181"
+    environment:
+      - CATALOG_CATALOG__IMPL=org.apache.iceberg.hadoop.HadoopCatalog
+      - CATALOG_WAREHOUSE=/app/data/iceberg
+      - CATALOG_IO__IMPL=org.apache.iceberg.hadoop.HadoopFileIO
+    volumes:
+      - ./data/iceberg:/app/data/iceberg
+
+  trino:
+    image: trinodb/trino:435
+    container_name: trino
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./trino/etc:/etc/trino
+      - ./data/iceberg:/app/data/iceberg
+    depends_on:
+      - iceberg-rest
