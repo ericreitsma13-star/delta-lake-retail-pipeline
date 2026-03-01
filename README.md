@@ -1,6 +1,6 @@
 # Delta Lake + Iceberg Retail Sales Pipeline
 
-A local **medallion architecture** pipeline built with PySpark, running in Docker. Ingests retail sales CSV files and processes them through bronze, silver, and gold layers — writing to **both Delta Lake and Apache Iceberg simultaneously** on every run.
+A local **medallion architecture** pipeline built with PySpark, running in Docker. Ingests retail sales CSV files and processes them through bronze, silver, and gold layers — writing to **both Delta Lake and Apache Iceberg simultaneously** on every run. Gold tables are queryable via **Trino** for ad-hoc SQL without PySpark.
 
 Built as a portfolio project to demonstrate modern data lakehouse patterns — designed to be extended to cloud storage (ADLS, S3) or Databricks with minimal changes.
 
@@ -12,9 +12,14 @@ Built as a portfolio project to demonstrate modern data lakehouse patterns — d
 CSV Files  →  Bronze (raw)  →  Silver (cleansed)  →  Gold (aggregated)
                Delta + Iceberg   Delta + Iceberg        Delta + Iceberg
                append-only       MERGE / upsert         replaceWhere / MERGE
+                                                               ↓
+                                                        iceberg-rest (REST catalog)
+                                                               ↓
+                                                         Trino :8080
+                                                      (ad-hoc SQL queries)
 ```
 
-Both formats run in parallel on every pipeline execution. Delta and Iceberg operate through separate catalogs; the same business logic serves both.
+Both formats run in parallel on every pipeline execution. Delta and Iceberg operate through separate catalogs; the same business logic serves both. Trino connects to the Iceberg gold tables via a REST catalog bridge (`tabulario/iceberg-rest`) that sits in front of the Hadoop-catalog warehouse — no table registration step required.
 
 | Layer | Description | Delta pattern | Iceberg pattern |
 |---|---|---|---|
@@ -75,6 +80,8 @@ Two CSV files simulating incremental batch loads of retail sales transactions:
 | PySpark | 3.5.0 |
 | delta-spark | 3.2.0 |
 | iceberg-spark-runtime | 1.5.2 |
+| Trino | 435 |
+| iceberg-rest (REST catalog bridge) | tabulario/iceberg-rest:latest |
 | Java | 17 (OpenJDK) |
 | Docker base image | `python:3.11-slim-bookworm` |
 | Testing | pytest 7.4 + chispa |
@@ -90,6 +97,13 @@ The Iceberg JAR is downloaded from Maven at container startup via `spark.jars.pa
 ├── docker-compose.yml
 ├── requirements.txt
 ├── run_pipeline.py               # 6-step dual-format orchestrator
+├── trino/
+│   └── etc/
+│       ├── config.properties     # Trino coordinator config
+│       ├── node.properties
+│       ├── jvm.config
+│       └── catalog/
+│           └── iceberg.properties  # REST catalog → iceberg-rest:8181
 ├── data/
 │   ├── source/                   # Input CSVs (tracked)
 │   ├── bronze/                   # Raw Delta table (gitignored)
@@ -168,6 +182,34 @@ The pipeline is **idempotent**: re-running appends to bronze, but the silver MER
 
 ---
 
+## Ad-hoc SQL with Trino
+
+After running the pipeline, the Iceberg gold tables are queryable via Trino at `localhost:8080`:
+
+```bash
+# Open the Trino CLI
+docker compose exec trino trino
+
+# Inside the CLI:
+SHOW SCHEMAS FROM iceberg;
+SHOW TABLES FROM iceberg.retail;
+
+SELECT * FROM iceberg.retail.gold_daily_sales_by_region
+ORDER BY event_date, region LIMIT 10;
+
+SELECT region, SUM(total_revenue) AS revenue
+FROM iceberg.retail.gold_daily_sales_by_region
+GROUP BY region ORDER BY revenue DESC;
+
+SELECT category, SUM(total_revenue) AS revenue, AVG(avg_unit_price) AS avg_price
+FROM iceberg.retail.gold_daily_sales_by_category
+GROUP BY category ORDER BY revenue DESC;
+```
+
+`iceberg-rest` (`tabulario/iceberg-rest`) acts as a REST catalog bridge over the Hadoop-catalog warehouse directory. Trino discovers tables written by Spark automatically — no registration step is needed. Both `iceberg-rest` and `trino` mount `./data/iceberg` at `/app/data/iceberg` so Iceberg metadata file paths resolve identically in every container.
+
+---
+
 ## Tests
 
 34 tests covering all three layers in both formats, plus a full end-to-end incremental load scenario.
@@ -215,6 +257,7 @@ docker compose exec spark-master pytest tests/ -v --tb=short
 - **Orchestration** — wrap each layer in an Airflow DAG or Databricks Workflow task
 - **Streaming** — replace `spark.read.csv()` in bronze with `spark.readStream` for near-real-time ingestion
 - **SCD Type 2** — extend the silver MERGE to track row history instead of overwriting matched rows
+- **BI / dashboards** — connect any JDBC-compatible tool (DBeaver, Metabase, Superset) to Trino at `localhost:8080` using the `iceberg` catalog
 
 ---
 
