@@ -5,7 +5,9 @@ from __future__ import annotations
 from pyspark.sql import SparkSession
 from pyspark.sql.functions import current_timestamp, input_file_name, to_date
 
-from src.config import BRONZE_PATH, ICEBERG_BRONZE_TABLE, SOURCE_PATH
+from delta.tables import DeltaTable
+
+from src.config import BRONZE_PATH, ICEBERG_BRONZE_TABLE, SOURCE_PATH, STAGING_TRANSACTIONS_PATH
 from src.utils.iceberg_utils import iceberg_table_exists
 from src.utils.schema_utils import SOURCE_SCHEMA
 
@@ -29,9 +31,13 @@ def ingest_bronze(
     source_path: str = SOURCE_PATH,
     output_path: str = BRONZE_PATH,
     iceberg_table: str = ICEBERG_BRONZE_TABLE,
+    staging_path: str = STAGING_TRANSACTIONS_PATH,
     format: str = "delta",
 ) -> int:
     """Read all CSV files from *source_path* and append raw rows to the bronze table.
+
+    If a staging Delta table exists at *staging_path*, its rows are unioned with
+    the CSV rows before writing to bronze (used to process API-submitted transactions).
 
     Metadata columns added:
     - ``_ingested_at``: timestamp of ingestion (current_timestamp)
@@ -45,6 +51,8 @@ def ingest_bronze(
             Ignored when *format* is ``"iceberg"``.
         iceberg_table: Fully-qualified Iceberg table name. Defaults to ``ICEBERG_BRONZE_TABLE``.
             Ignored when *format* is ``"delta"``.
+        staging_path: Path to the staging Delta table. Rows are unioned with CSV rows
+            when the table exists. Defaults to ``STAGING_TRANSACTIONS_PATH``.
         format: ``"delta"`` (default) or ``"iceberg"``.
 
     Returns:
@@ -56,6 +64,11 @@ def ingest_bronze(
         .schema(SOURCE_SCHEMA)
         .load(source_path)
     )
+
+    # Union staged API transactions (if any) with CSV source rows
+    if DeltaTable.isDeltaTable(spark, staging_path):
+        staged_df = spark.read.format("delta").load(staging_path).select(SOURCE_SCHEMA.fieldNames())
+        raw_df = raw_df.unionByName(staged_df)
 
     bronze_df = raw_df.withColumn(
         "_ingested_at", current_timestamp()

@@ -13,7 +13,14 @@ from pyspark.sql.functions import (
 )
 from pyspark.sql.window import Window
 
-from src.config import BRONZE_PATH, ICEBERG_BRONZE_TABLE, ICEBERG_SILVER_TABLE, SILVER_PATH
+from src.config import (
+    BRONZE_PATH,
+    BRONZE_PRODUCTS_PATH,
+    ICEBERG_BRONZE_TABLE,
+    ICEBERG_SILVER_TABLE,
+    SILVER_ENRICHED_PATH,
+    SILVER_PATH,
+)
 from src.utils.delta_utils import merge_into_delta
 from src.utils.iceberg_utils import merge_into_iceberg
 
@@ -113,3 +120,48 @@ def transform_silver(
     _set_delta_table_properties(spark, silver_path)
 
     return {"rows_read": rows_read, "rows_merged": rows_merged}
+
+
+def enrich_silver_with_products(
+    spark: SparkSession,
+    silver_path: str = SILVER_PATH,
+    products_path: str = BRONZE_PRODUCTS_PATH,
+    enriched_path: str = SILVER_ENRICHED_PATH,
+) -> int:
+    """Join silver transactions with bronze products to produce the enriched derived table.
+
+    Adds ``supplier``, ``cost_price``, and ``is_active`` from the products dimension.
+    A left join is used so transactions with unknown product_ids are retained (nulls for
+    the three product columns).
+
+    The output is a **full overwrite** of ``transactions_enriched`` — this table is a
+    derived view, not a source of truth, so overwrite is safe.
+
+    Args:
+        spark: Active SparkSession.
+        silver_path: Source Delta silver transactions table path.
+        products_path: Source Delta bronze products table path.
+        enriched_path: Destination Delta table path for the enriched view.
+
+    Returns:
+        Number of rows written to the enriched table.
+    """
+    silver_df = spark.read.format("delta").load(silver_path)
+    products_df = (
+        spark.read.format("delta")
+        .load(products_path)
+        .select("product_id", "supplier", "cost_price", "is_active")
+    )
+
+    enriched_df = silver_df.join(products_df, on="product_id", how="left")
+
+    (
+        enriched_df.write.format("delta")
+        .mode("overwrite")
+        .option("overwriteSchema", "true")
+        .partitionBy("event_date")
+        .save(enriched_path)
+    )
+    _set_delta_table_properties(spark, enriched_path)
+
+    return enriched_df.count()

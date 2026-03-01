@@ -7,10 +7,12 @@ from pyspark.sql.functions import avg, col, count, sum as spark_sum
 
 from src.config import (
     GOLD_CATEGORY_PATH,
+    GOLD_MARGIN_PATH,
     GOLD_REGION_PATH,
     ICEBERG_GOLD_CATEGORY_TABLE,
     ICEBERG_GOLD_REGION_TABLE,
     ICEBERG_SILVER_TABLE,
+    SILVER_ENRICHED_PATH,
     SILVER_PATH,
 )
 from src.utils.delta_utils import optimize_table
@@ -171,3 +173,58 @@ def aggregate_gold(
     )
     _set_delta_table_properties(spark, category_path)
     optimize_table(spark, category_path, zorder_columns=["category"])
+
+
+def aggregate_gold_margin(
+    spark: SparkSession,
+    enriched_path: str = SILVER_ENRICHED_PATH,
+    margin_path: str = GOLD_MARGIN_PATH,
+) -> None:
+    """Compute daily margin metrics by category and write to the gold margin Delta table.
+
+    Source: ``silver/transactions_enriched`` filtered to rows where
+    ``_is_valid = true`` AND ``is_active = true`` (excludes bad data and
+    discontinued products).
+
+    Metrics computed:
+    - ``total_revenue``: sum of ``total_amount``
+    - ``total_cost``: sum of ``cost_price * quantity``
+    - ``gross_margin``: ``total_revenue - total_cost``
+    - ``margin_pct``: ``(gross_margin / total_revenue) * 100``
+
+    Written using ``replaceWhere`` (partition-safe overwrite) partitioned by
+    ``event_date``, then OPTIMIZE + ZORDER by ``category``.
+
+    Args:
+        spark: Active SparkSession.
+        enriched_path: Source Delta enriched silver table path. Defaults to ``SILVER_ENRICHED_PATH``.
+        margin_path: Destination Delta table path. Defaults to ``GOLD_MARGIN_PATH``.
+    """
+    enriched_df = (
+        spark.read.format("delta")
+        .load(enriched_path)
+        .filter((col("_is_valid") == True) & (col("is_active") == True))  # noqa: E712
+    )
+
+    margin_df = enriched_df.groupBy("event_date", "category").agg(
+        spark_sum("total_amount").alias("total_revenue"),
+        spark_sum(col("cost_price") * col("quantity")).alias("total_cost"),
+    )
+
+    margin_df = margin_df.withColumn(
+        "gross_margin", col("total_revenue") - col("total_cost")
+    ).withColumn(
+        "margin_pct", (col("gross_margin") / col("total_revenue")) * 100
+    )
+
+    replace_where = _replaceWhere_dates(margin_df)
+
+    (
+        margin_df.write.format("delta")
+        .mode("overwrite")
+        .option("replaceWhere", replace_where)
+        .partitionBy("event_date")
+        .save(margin_path)
+    )
+    _set_delta_table_properties(spark, margin_path)
+    optimize_table(spark, margin_path, zorder_columns=["category"])

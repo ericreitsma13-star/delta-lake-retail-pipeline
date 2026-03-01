@@ -94,3 +94,47 @@ GOLD_CATEGORY_SCHEMA = StructType(
         StructField("avg_unit_price", DoubleType(), nullable=True),
     ]
 )
+
+# ---------------------------------------------------------------------------
+# Products dimension (Parquet source + Bronze Delta)
+# ---------------------------------------------------------------------------
+
+PRODUCTS_SCHEMA = StructType(
+    [
+        StructField("product_id", StringType(), nullable=False),
+        StructField("product_name", StringType(), nullable=True),
+        StructField("category", StringType(), nullable=True),
+        StructField("supplier", StringType(), nullable=True),
+        StructField("cost_price", DoubleType(), nullable=True),
+        StructField("launch_date", DateType(), nullable=True),
+        StructField("is_active", BooleanType(), nullable=True),
+    ]
+)
+
+# ---------------------------------------------------------------------------
+# Silver — transactions_enriched (silver transactions joined with products)
+# ---------------------------------------------------------------------------
+
+SILVER_ENRICHED_SCHEMA = StructType(
+    SILVER_SCHEMA.fields
+    + [
+        StructField("supplier", StringType(), nullable=True),
+        StructField("cost_price", DoubleType(), nullable=True),
+        StructField("is_active", BooleanType(), nullable=True),
+    ]
+)
+
+# ---------------------------------------------------------------------------
+# Gold — daily_margin_by_category
+# ---------------------------------------------------------------------------
+
+GOLD_MARGIN_SCHEMA = StructType(
+    [
+        StructField("event_date", DateType(), nullable=False),
+        StructField("category", StringType(), nullable=False),
+        StructField("total_revenue", DoubleType(), nullable=True),
+        StructField("total_cost", DoubleType(), nullable=True),
+        StructField("gross_margin", DoubleType(), nullable=True),
+        StructField("margin_pct", DoubleType(), nullable=True),
+    ]
+)

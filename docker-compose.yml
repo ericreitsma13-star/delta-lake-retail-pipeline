@@ -11,6 +11,7 @@ services:
       - ./data:/app/data
       - ./src:/app/src
       - ./tests:/app/tests
+      - ./scripts:/app/scripts
       - ./run_pipeline.py:/app/run_pipeline.py
       - ./requirements.txt:/app/requirements.txt
 
@@ -49,3 +50,19 @@ services:
       - ./data/iceberg:/app/data/iceberg
     depends_on:
       - iceberg-rest
+
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile.api
+    container_name: api
+    ports:
+      - "8000:8000"
+    environment:
+      - PYTHONPATH=/app
+    volumes:
+      - ./data:/app/data
+      - ./src:/app/src
+      - ./api:/app/api
+    depends_on:
+      - spark-master

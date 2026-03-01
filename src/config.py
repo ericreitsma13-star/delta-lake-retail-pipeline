@@ -15,10 +15,15 @@ BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DATA_DIR = os.path.join(BASE_DIR, "data")
 
 SOURCE_PATH: str = os.path.join(DATA_DIR, "source")
+SOURCE_PRODUCTS_PATH: str = os.path.join(DATA_DIR, "source", "products.parquet")
 BRONZE_PATH: str = os.path.join(DATA_DIR, "bronze", "sales_transactions")
+BRONZE_PRODUCTS_PATH: str = os.path.join(DATA_DIR, "bronze", "products")
 SILVER_PATH: str = os.path.join(DATA_DIR, "silver", "sales_transactions")
+SILVER_ENRICHED_PATH: str = os.path.join(DATA_DIR, "silver", "transactions_enriched")
 GOLD_REGION_PATH: str = os.path.join(DATA_DIR, "gold", "daily_sales_by_region")
 GOLD_CATEGORY_PATH: str = os.path.join(DATA_DIR, "gold", "daily_sales_by_category")
+GOLD_MARGIN_PATH: str = os.path.join(DATA_DIR, "gold", "daily_margin_by_category")
+STAGING_TRANSACTIONS_PATH: str = os.path.join(DATA_DIR, "staging", "transactions")
 
 # ---------------------------------------------------------------------------
 # Delta table name constants
