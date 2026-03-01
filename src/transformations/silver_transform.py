@@ -31,7 +31,11 @@ def _set_table_properties(spark: SparkSession, path: str) -> None:
     spark.sql(f"ALTER TABLE delta.`{path}` SET TBLPROPERTIES ({props})")
 
 
-def transform_silver(spark: SparkSession) -> dict:
+def transform_silver(
+    spark: SparkSession,
+    bronze_path: str = BRONZE_PATH,
+    silver_path: str = SILVER_PATH,
+) -> dict:
     """Read bronze, apply quality rules, deduplicate, and merge into silver.
 
     Transformations applied:
@@ -45,11 +49,13 @@ def transform_silver(spark: SparkSession) -> dict:
 
     Args:
         spark: Active SparkSession.
+        bronze_path: Source Delta table path. Defaults to ``BRONZE_PATH``.
+        silver_path: Target Delta table path. Defaults to ``SILVER_PATH``.
 
     Returns:
         Dict with keys ``rows_read`` and ``rows_merged``.
     """
-    bronze_df = spark.read.format("delta").load(BRONZE_PATH)
+    bronze_df = spark.read.format("delta").load(bronze_path)
     rows_read = bronze_df.count()
 
     # Cast event_date from string to DateType
@@ -78,10 +84,10 @@ def transform_silver(spark: SparkSession) -> dict:
     merge_into_delta(
         spark=spark,
         source_df=silver_df,
-        target_path=SILVER_PATH,
+        target_path=silver_path,
         merge_keys=["transaction_id"],
     )
 
-    _set_table_properties(spark, SILVER_PATH)
+    _set_table_properties(spark, silver_path)
 
     return {"rows_read": rows_read, "rows_merged": rows_merged}

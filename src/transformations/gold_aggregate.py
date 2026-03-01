@@ -23,18 +23,19 @@ def _set_table_properties(spark: SparkSession, path: str) -> None:
     spark.sql(f"ALTER TABLE delta.`{path}` SET TBLPROPERTIES ({props})")
 
 
-def _get_valid_silver(spark: SparkSession):
+def _get_valid_silver(spark: SparkSession, silver_path: str = SILVER_PATH):
     """Read silver table filtering to valid rows only.
 
     Args:
         spark: Active SparkSession.
+        silver_path: Path to the silver Delta table.
 
     Returns:
         DataFrame of valid silver rows.
     """
     return (
         spark.read.format("delta")
-        .load(SILVER_PATH)
+        .load(silver_path)
         .filter(col("_is_valid") == True)  # noqa: E712
     )
 
@@ -48,7 +49,12 @@ def _replaceWhere_dates(df) -> str:
     return f"event_date IN ({date_literals})"
 
 
-def aggregate_gold(spark: SparkSession) -> None:
+def aggregate_gold(
+    spark: SparkSession,
+    silver_path: str = SILVER_PATH,
+    region_path: str = GOLD_REGION_PATH,
+    category_path: str = GOLD_CATEGORY_PATH,
+) -> None:
     """Compute both gold aggregations and write with partition-safe replaceWhere.
 
     Reads only ``_is_valid = true`` rows from silver, then produces:
@@ -62,8 +68,11 @@ def aggregate_gold(spark: SparkSession) -> None:
 
     Args:
         spark: Active SparkSession.
+        silver_path: Source silver Delta table path. Defaults to ``SILVER_PATH``.
+        region_path: Destination path for daily_sales_by_region. Defaults to ``GOLD_REGION_PATH``.
+        category_path: Destination path for daily_sales_by_category. Defaults to ``GOLD_CATEGORY_PATH``.
     """
-    valid_df = _get_valid_silver(spark)
+    valid_df = _get_valid_silver(spark, silver_path)
 
     # ------------------------------------------------------------------
     # daily_sales_by_region
@@ -82,10 +91,10 @@ def aggregate_gold(spark: SparkSession) -> None:
         .mode("overwrite")
         .option("replaceWhere", region_replace_where)
         .partitionBy("event_date")
-        .save(GOLD_REGION_PATH)
+        .save(region_path)
     )
-    _set_table_properties(spark, GOLD_REGION_PATH)
-    optimize_table(spark, GOLD_REGION_PATH, zorder_columns=["region"])
+    _set_table_properties(spark, region_path)
+    optimize_table(spark, region_path, zorder_columns=["region"])
 
     # ------------------------------------------------------------------
     # daily_sales_by_category
@@ -104,7 +113,7 @@ def aggregate_gold(spark: SparkSession) -> None:
         .mode("overwrite")
         .option("replaceWhere", category_replace_where)
         .partitionBy("event_date")
-        .save(GOLD_CATEGORY_PATH)
+        .save(category_path)
     )
-    _set_table_properties(spark, GOLD_CATEGORY_PATH)
-    optimize_table(spark, GOLD_CATEGORY_PATH, zorder_columns=["category"])
+    _set_table_properties(spark, category_path)
+    optimize_table(spark, category_path, zorder_columns=["category"])
