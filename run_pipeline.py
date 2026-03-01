@@ -1,4 +1,4 @@
-"""Orchestrator script: runs the full Bronze → Silver → Gold pipeline."""
+"""Orchestrator script: runs the full Bronze → Silver → Gold pipeline for both Delta and Iceberg."""
 
 from __future__ import annotations
 
@@ -10,46 +10,69 @@ from src.transformations.gold_aggregate import aggregate_gold
 from src.transformations.silver_transform import transform_silver
 
 
+def _elapsed(t0: float) -> str:
+    return f"{time.time() - t0:.1f}s"
+
+
 def main() -> None:
     spark = get_spark_session()
     print("=" * 60)
-    print("Delta Lake Retail Pipeline — starting")
+    print("Retail Pipeline — Delta + Iceberg parallel run")
     print("=" * 60)
 
     # ------------------------------------------------------------------
-    # Bronze
+    # Delta pass  [1/6] → [3/6]
     # ------------------------------------------------------------------
-    print("\n[1/3] Bronze ingestion ...")
-    t0 = time.time()
-    bronze_rows = ingest_bronze(spark)
-    bronze_elapsed = time.time() - t0
-    print(f"      Done — {bronze_rows:,} rows ingested in {bronze_elapsed:.1f}s")
+    print("\n--- Delta Lake ---")
 
-    # ------------------------------------------------------------------
-    # Silver
-    # ------------------------------------------------------------------
-    print("\n[2/3] Silver transformation ...")
+    print("\n[1/6] Bronze ingestion (Delta) ...")
     t0 = time.time()
-    silver_stats = transform_silver(spark)
-    silver_elapsed = time.time() - t0
+    bronze_rows = ingest_bronze(spark, format="delta")
+    print(f"      Done — {bronze_rows:,} rows in {_elapsed(t0)}")
+
+    print("\n[2/6] Silver transformation (Delta) ...")
+    t0 = time.time()
+    silver_stats = transform_silver(spark, format="delta")
     print(
-        f"      Done — read {silver_stats['rows_read']:,} rows, "
-        f"merged {silver_stats['rows_merged']:,} rows in {silver_elapsed:.1f}s"
+        f"      Done — read {silver_stats['rows_read']:,}, "
+        f"merged {silver_stats['rows_merged']:,} rows in {_elapsed(t0)}"
     )
 
-    # ------------------------------------------------------------------
-    # Gold
-    # ------------------------------------------------------------------
-    print("\n[3/3] Gold aggregation ...")
+    print("\n[3/6] Gold aggregation (Delta) ...")
     t0 = time.time()
-    aggregate_gold(spark)
-    gold_elapsed = time.time() - t0
-    print(f"      Done — aggregations written in {gold_elapsed:.1f}s")
+    aggregate_gold(spark, format="delta")
+    print(f"      Done — aggregations written in {_elapsed(t0)}")
 
+    # ------------------------------------------------------------------
+    # Iceberg pass  [4/6] → [6/6]
+    # ------------------------------------------------------------------
+    print("\n--- Apache Iceberg ---")
+
+    print("\n[4/6] Bronze ingestion (Iceberg) ...")
+    t0 = time.time()
+    ice_bronze_rows = ingest_bronze(spark, format="iceberg")
+    print(f"      Done — {ice_bronze_rows:,} rows in {_elapsed(t0)}")
+
+    print("\n[5/6] Silver transformation (Iceberg) ...")
+    t0 = time.time()
+    ice_silver_stats = transform_silver(spark, format="iceberg")
+    print(
+        f"      Done — read {ice_silver_stats['rows_read']:,}, "
+        f"merged {ice_silver_stats['rows_merged']:,} rows in {_elapsed(t0)}"
+    )
+
+    print("\n[6/6] Gold aggregation (Iceberg) ...")
+    t0 = time.time()
+    aggregate_gold(spark, format="iceberg")
+    print(f"      Done — aggregations written in {_elapsed(t0)}")
+
+    # ------------------------------------------------------------------
+    # Summary
+    # ------------------------------------------------------------------
     print("\n" + "=" * 60)
     print("Pipeline complete.")
-    print(f"  Bronze rows : {bronze_rows:,}")
-    print(f"  Silver merged: {silver_stats['rows_merged']:,}")
+    print(f"  Delta   — bronze rows: {bronze_rows:,}  silver merged: {silver_stats['rows_merged']:,}")
+    print(f"  Iceberg — bronze rows: {ice_bronze_rows:,}  silver merged: {ice_silver_stats['rows_merged']:,}")
     print("=" * 60)
 
 

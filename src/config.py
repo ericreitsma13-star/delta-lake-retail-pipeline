@@ -21,16 +21,33 @@ GOLD_REGION_PATH: str = os.path.join(DATA_DIR, "gold", "daily_sales_by_region")
 GOLD_CATEGORY_PATH: str = os.path.join(DATA_DIR, "gold", "daily_sales_by_category")
 
 # ---------------------------------------------------------------------------
-# Table name constants
+# Delta table name constants
 # ---------------------------------------------------------------------------
 BRONZE_TABLE: str = "bronze_sales_transactions"
 SILVER_TABLE: str = "silver_sales_transactions"
 GOLD_REGION_TABLE: str = "gold_daily_sales_by_region"
 GOLD_CATEGORY_TABLE: str = "gold_daily_sales_by_category"
 
+# ---------------------------------------------------------------------------
+# Iceberg path and catalog constants
+# ---------------------------------------------------------------------------
+ICEBERG_WAREHOUSE: str = os.path.join(DATA_DIR, "iceberg")
+ICEBERG_DB: str = "retail"
+ICEBERG_BRONZE_TABLE: str = "iceberg.retail.bronze_sales_transactions"
+ICEBERG_SILVER_TABLE: str = "iceberg.retail.silver_sales_transactions"
+ICEBERG_GOLD_REGION_TABLE: str = "iceberg.retail.gold_daily_sales_by_region"
+ICEBERG_GOLD_CATEGORY_TABLE: str = "iceberg.retail.gold_daily_sales_by_category"
+
+_ICEBERG_PACKAGE: str = "org.apache.iceberg:iceberg-spark-runtime-3.5_2.12:1.5.2"
+
 
 def get_spark_session(app_name: str = "RetailPipeline") -> SparkSession:
-    """Return (or create) the singleton SparkSession with Delta Lake extensions.
+    """Return (or create) the singleton SparkSession with Delta Lake and Iceberg extensions.
+
+    Configures:
+    - Delta Lake via ``configure_spark_with_delta_pip`` (downloads JAR at startup)
+    - Apache Iceberg via ``spark.jars.packages`` (downloaded alongside Delta)
+    - A named ``iceberg`` catalog backed by the local ``./data/iceberg/`` warehouse
 
     Args:
         app_name: Spark application name shown in the UI.
@@ -44,7 +61,10 @@ def get_spark_session(app_name: str = "RetailPipeline") -> SparkSession:
             SparkSession.builder.appName(app_name)
             .config(
                 "spark.sql.extensions",
-                "io.delta.sql.DeltaSparkSessionExtension",
+                (
+                    "io.delta.sql.DeltaSparkSessionExtension,"
+                    "org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions"
+                ),
             )
             .config(
                 "spark.sql.catalog.spark_catalog",
@@ -54,6 +74,15 @@ def get_spark_session(app_name: str = "RetailPipeline") -> SparkSession:
                 "spark.databricks.delta.retentionDurationCheck.enabled",
                 "false",
             )
+            # Iceberg named catalog (runs alongside Delta's spark_catalog)
+            .config("spark.sql.catalog.iceberg", "org.apache.iceberg.spark.SparkCatalog")
+            .config("spark.sql.catalog.iceberg.type", "hadoop")
+            .config("spark.sql.catalog.iceberg.warehouse", ICEBERG_WAREHOUSE)
         )
-        _spark = configure_spark_with_delta_pip(builder).getOrCreate()
+        _spark = configure_spark_with_delta_pip(
+            builder,
+            extra_packages=[_ICEBERG_PACKAGE],
+        ).getOrCreate()
+        # Ensure the retail namespace exists in the Iceberg catalog
+        _spark.sql(f"CREATE NAMESPACE IF NOT EXISTS iceberg.{ICEBERG_DB}")
     return _spark

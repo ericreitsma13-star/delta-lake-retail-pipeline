@@ -13,8 +13,9 @@ from pyspark.sql.functions import (
 )
 from pyspark.sql.window import Window
 
-from src.config import BRONZE_PATH, SILVER_PATH
+from src.config import BRONZE_PATH, ICEBERG_BRONZE_TABLE, ICEBERG_SILVER_TABLE, SILVER_PATH
 from src.utils.delta_utils import merge_into_delta
+from src.utils.iceberg_utils import merge_into_iceberg
 
 _DELTA_PROPERTIES = {
     "delta.autoOptimize.optimizeWrite": "true",
@@ -23,7 +24,7 @@ _DELTA_PROPERTIES = {
 }
 
 
-def _set_table_properties(spark: SparkSession, path: str) -> None:
+def _set_delta_table_properties(spark: SparkSession, path: str) -> None:
     """Apply Delta table properties via ALTER TABLE SQL."""
     props = ", ".join(
         f"'{k}' = '{v}'" for k, v in _DELTA_PROPERTIES.items()
@@ -31,10 +32,31 @@ def _set_table_properties(spark: SparkSession, path: str) -> None:
     spark.sql(f"ALTER TABLE delta.`{path}` SET TBLPROPERTIES ({props})")
 
 
+def _build_silver_df(bronze_df):
+    """Apply cleanse / validate / deduplicate transformations to a bronze DataFrame."""
+    silver_df = bronze_df.withColumn("event_date", to_date(col("event_date"), "yyyy-MM-dd"))
+
+    customer_valid = col("customer_id").isNotNull() & (trim(col("customer_id")) != "")
+    amount_valid = col("total_amount") > 0
+    silver_df = silver_df.withColumn("_is_valid", customer_valid & amount_valid)
+
+    window_spec = Window.partitionBy("transaction_id").orderBy(col("_ingested_at").desc())
+    silver_df = (
+        silver_df.withColumn("_rank", rank().over(window_spec))
+        .filter(col("_rank") == 1)
+        .drop("_rank")
+    )
+
+    return silver_df.withColumn("_updated_at", current_timestamp())
+
+
 def transform_silver(
     spark: SparkSession,
     bronze_path: str = BRONZE_PATH,
     silver_path: str = SILVER_PATH,
+    bronze_table: str = ICEBERG_BRONZE_TABLE,
+    silver_table: str = ICEBERG_SILVER_TABLE,
+    format: str = "delta",
 ) -> dict:
     """Read bronze, apply quality rules, deduplicate, and merge into silver.
 
@@ -50,35 +72,36 @@ def transform_silver(
     Args:
         spark: Active SparkSession.
         bronze_path: Source Delta table path. Defaults to ``BRONZE_PATH``.
+            Ignored when *format* is ``"iceberg"``.
         silver_path: Target Delta table path. Defaults to ``SILVER_PATH``.
+            Ignored when *format* is ``"iceberg"``.
+        bronze_table: Fully-qualified Iceberg bronze table name.
+            Ignored when *format* is ``"delta"``.
+        silver_table: Fully-qualified Iceberg silver table name.
+            Ignored when *format* is ``"delta"``.
+        format: ``"delta"`` (default) or ``"iceberg"``.
 
     Returns:
         Dict with keys ``rows_read`` and ``rows_merged``.
     """
+    if format == "iceberg":
+        bronze_df = spark.table(bronze_table)
+        rows_read = bronze_df.count()
+        silver_df = _build_silver_df(bronze_df)
+        rows_merged = silver_df.count()
+        merge_into_iceberg(
+            spark=spark,
+            source_df=silver_df,
+            table_name=silver_table,
+            merge_keys=["transaction_id"],
+            partition_cols=["event_date"],
+        )
+        return {"rows_read": rows_read, "rows_merged": rows_merged}
+
+    # Delta path
     bronze_df = spark.read.format("delta").load(bronze_path)
     rows_read = bronze_df.count()
-
-    # Cast event_date from string to DateType
-    silver_df = bronze_df.withColumn("event_date", to_date(col("event_date"), "yyyy-MM-dd"))
-
-    # Validation flag
-    customer_valid = col("customer_id").isNotNull() & (trim(col("customer_id")) != "")
-    amount_valid = col("total_amount") > 0
-    silver_df = silver_df.withColumn(
-        "_is_valid", customer_valid & amount_valid
-    )
-
-    # Deduplicate: keep latest _ingested_at per transaction_id
-    window_spec = Window.partitionBy("transaction_id").orderBy(col("_ingested_at").desc())
-    silver_df = (
-        silver_df.withColumn("_rank", rank().over(window_spec))
-        .filter(col("_rank") == 1)
-        .drop("_rank")
-    )
-
-    # Add _updated_at audit column
-    silver_df = silver_df.withColumn("_updated_at", current_timestamp())
-
+    silver_df = _build_silver_df(bronze_df)
     rows_merged = silver_df.count()
 
     merge_into_delta(
@@ -87,7 +110,6 @@ def transform_silver(
         target_path=silver_path,
         merge_keys=["transaction_id"],
     )
-
-    _set_table_properties(spark, silver_path)
+    _set_delta_table_properties(spark, silver_path)
 
     return {"rows_read": rows_read, "rows_merged": rows_merged}

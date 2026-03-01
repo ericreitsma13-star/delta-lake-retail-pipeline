@@ -1,7 +1,8 @@
-# Delta Lake data directories (too large for git)
+# Delta Lake and Iceberg data directories (too large for git)
 data/bronze/
 data/silver/
 data/gold/
+data/iceberg/
 
 # Keep source CSVs tracked
 !data/source/
