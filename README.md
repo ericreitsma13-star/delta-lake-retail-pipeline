@@ -104,7 +104,8 @@ Two CSV files simulating incremental batch loads of retail sales transactions:
     ├── conftest.py               # Session-scoped SparkSession fixture
     ├── test_bronze.py
     ├── test_silver.py
-    └── test_gold.py
+    ├── test_gold.py
+    └── test_e2e_incremental.py   # Two-batch incremental load + idempotency
 ```
 
 ---
@@ -148,17 +149,26 @@ The pipeline is **idempotent**: re-running appends to bronze, but the silver MER
 
 ## Tests
 
-18 unit tests covering all three layers, using a local-mode SparkSession (no Docker required if running pytest directly with the right Python env).
+19 tests covering all three layers plus a full end-to-end incremental load scenario, using a local-mode SparkSession (no Docker required if running pytest directly with the right Python env).
 
 ```
-tests/test_bronze.py   (6 tests)  — metadata columns, null checks, row counts, Delta write/read
-tests/test_silver.py   (6 tests)  — validation flags, date casting, deduplication, MERGE insert + update
-tests/test_gold.py     (6 tests)  — aggregation correctness, valid-row filtering, Delta write/read
+tests/test_bronze.py          (6 tests)  — metadata columns, null checks, row counts, Delta write/read
+tests/test_silver.py          (6 tests)  — validation flags, date casting, deduplication, MERGE insert + update
+tests/test_gold.py            (6 tests)  — aggregation correctness, valid-row filtering, Delta write/read
+tests/test_e2e_incremental.py (1 test)   — two-batch incremental load + idempotency across all layers
 ```
+
+The end-to-end test proves the following guarantees with known data:
+
+| State | Bronze | Silver | Gold |
+|---|---|---|---|
+| After load 1 (4 rows, Jan) | 4 | 4 | Jan partitions only |
+| After load 2 (3 new rows, Feb) | 7 | 7 | Jan unchanged + Feb added |
+| After re-run of load 2 | 10 | **7** (no duplicates) | **identical to above** |
 
 ```bash
 docker compose exec spark-master pytest tests/ -v --tb=short
-# 18 passed in ~20s
+# 19 passed in ~55s
 ```
 
 ---
