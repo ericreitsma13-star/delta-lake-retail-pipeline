@@ -29,7 +29,7 @@ Gold tables ──────────────────────�
 Both Delta and Iceberg formats run in parallel on every pipeline execution. The FastAPI service exposes gold tables as JSON endpoints and accepts new transactions via a staging table that feeds into the next pipeline run.
 
 | Layer | Description | Delta pattern | Iceberg pattern |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | **Bronze** | Raw ingestion, metadata added, no transforms | Append + `mergeSchema` | `writeTo().create()` / `.append()` |
 | **Bronze Products** | Dimension table (full overwrite each run) | Full overwrite | — (Delta only) |
 | **Silver** | Typed, deduplicated, validated, upserted | `MERGE INTO` on `transaction_id` | SQL `MERGE INTO` on `transaction_id` |
@@ -38,34 +38,147 @@ Both Delta and Iceberg formats run in parallel on every pipeline execution. The 
 
 ---
 
+## Technical Infrastructure
+
+The pipeline runs across 5 Docker services that share a local filesystem volume for all table data.
+
+```mermaid
+graph TD
+    Host["🖥️ Host Machine"]
+
+    subgraph Docker Network
+        SM["spark-master\n:4040 UI"]
+        SW["spark-worker\n(1 worker)"]
+        API["api\nFastAPI :8000"]
+        IR["iceberg-rest\nREST catalog :8181"]
+        TR["trino\nQuery engine :8080"]
+    end
+
+    subgraph Local Filesystem
+        DeltaVol["data/bronze\ndata/silver\ndata/gold\n(Delta tables)"]
+        IceVol["data/iceberg\n(Iceberg warehouse)"]
+        SrcVol["data/source\n(CSV + Parquet)"]
+    end
+
+    Host -->|":8000"| API
+    Host -->|":8080"| TR
+    Host -->|":4040"| SM
+
+    SM --> SW
+    API -->|"depends_on"| SM
+    TR -->|"depends_on"| IR
+
+    SM -->|"reads/writes"| DeltaVol
+    SM -->|"reads/writes"| IceVol
+    SM -->|"reads"| SrcVol
+    API -->|"reads/writes"| DeltaVol
+    API -->|"reads"| SrcVol
+    IR -->|"catalog over"| IceVol
+    TR -->|"queries via REST catalog"| IR
+```
+
+---
+
+## ETL / ELT Data Flow
+
+Delta Lake and Iceberg run as parallel write tracks on every pipeline execution. FastAPI serves Delta gold; Trino queries Iceberg gold.
+
+```mermaid
+graph TD
+    subgraph Sources
+        CSV["CSV files\nsales_jan_mar / apr_jun"]
+        PRQ["products.parquet\ndimension table"]
+        APOST["API POST\n/ingest/transaction"]
+    end
+
+    subgraph Staging
+        STG["data/staging/transactions\nDelta — append"]
+    end
+
+    subgraph Bronze["Bronze — Raw Ingestion"]
+        BRT["Delta: sales_transactions\nappend + mergeSchema"]
+        BRP["Delta: products\nfull overwrite"]
+        BRI["Iceberg: bronze_transactions\nappend"]
+    end
+
+    subgraph Silver["Silver — Cleansed &amp; Conformed"]
+        SRT["Delta: sales_transactions\nMERGE on transaction_id"]
+        SRE["Delta: transactions_enriched\nfull overwrite (derived)"]
+        SRI["Iceberg: silver_transactions\nMERGE on transaction_id"]
+    end
+
+    subgraph Gold["Gold — Aggregated Business Layer"]
+        GRD["Delta: daily_sales_by_region\nreplaceWhere + ZORDER"]
+        GCD["Delta: daily_sales_by_category\nreplaceWhere + ZORDER"]
+        GMD["Delta: daily_margin_by_category\nreplaceWhere + ZORDER"]
+        GRI["Iceberg: gold_daily_sales_by_region\nMERGE + rewrite_data_files"]
+        GCI["Iceberg: gold_daily_sales_by_category\nMERGE + rewrite_data_files"]
+    end
+
+    subgraph Consumption
+        FAPI["FastAPI :8000\nGET /sales/by-region\nGET /sales/by-category\nGET /sales/margin"]
+        TRINO["Trino :8080\nAd-hoc SQL"]
+    end
+
+    CSV -->|"read with explicit StructType"| BRT
+    STG -->|"union with CSV source"| BRT
+    PRQ -->|"read with explicit StructType"| BRP
+    APOST -->|"validated + staged"| STG
+    CSV -->|"read with explicit StructType"| BRI
+
+    BRT -->|"cast + validate + dedup"| SRT
+    BRP -->|"left join on product_id"| SRE
+    SRT -->|"join"| SRE
+    BRI -->|"cast + validate + dedup"| SRI
+
+    SRT -->|"group by event_date, region"| GRD
+    SRT -->|"group by event_date, category"| GCD
+    SRE -->|"group by event_date, category\nis_valid=true, is_active=true"| GMD
+    SRI -->|"group by event_date, region"| GRI
+    SRI -->|"group by event_date, category"| GCI
+
+    GRD -->|"read Delta"| FAPI
+    GCD -->|"read Delta"| FAPI
+    GMD -->|"read Delta"| FAPI
+    GRI -->|"query via REST catalog"| TRINO
+    GCI -->|"query via REST catalog"| TRINO
+```
+
+---
+
 ## Pipeline Layers
 
 ### Bronze — Raw Ingestion
-- Reads all CSVs from `data/source/` using explicit `StructType` (no `inferSchema`)
-- Unions rows from the API staging table (`data/staging/transactions/`) if present
-- Adds `_ingested_at`, `_source_file`, `ingestion_date` (partition key)
-- Products parquet read with explicit `PRODUCTS_SCHEMA`; written as full-overwrite Delta dimension
+
+* Reads all CSVs from `data/source/` using explicit `StructType` (no `inferSchema`)
+* Unions rows from the API staging table (`data/staging/transactions/`) if present
+* Adds `_ingested_at`, `_source_file`, `ingestion_date` (partition key)
+* Products parquet read with explicit `PRODUCTS_SCHEMA`; written as full-overwrite Delta dimension
 
 ### Silver — Cleansed & Conformed
-- Casts `event_date` from string → `DateType`
-- Flags `_is_valid = false` where `customer_id` is null/empty or `total_amount ≤ 0`
-- Deduplicates by `transaction_id`, keeping the row with the latest `_ingested_at`
-- MERGE upsert on `transaction_id` (Delta API / SQL MERGE for Iceberg)
-- **Silver Enriched**: left-joins silver transactions with bronze products on `product_id`, adding `supplier`, `cost_price`, `is_active`
+
+* Casts `event_date` from string → `DateType`
+* Flags `_is_valid = false` where `customer_id` is null/empty or `total_amount ≤ 0`
+* Deduplicates by `transaction_id`, keeping the row with the latest `_ingested_at`
+* MERGE upsert on `transaction_id` (Delta API / SQL MERGE for Iceberg)
+* **Silver Enriched**: left-joins silver transactions with bronze products on `product_id`, adding `supplier`, `cost_price`, `is_active`
 
 ### Gold — Aggregated Business Layer
 
 **`daily_sales_by_region`** — grouped by `event_date` + `region`
+
 ```
 total_revenue | total_transactions | total_units | avg_discount_pct
 ```
 
 **`daily_sales_by_category`** — grouped by `event_date` + `category`
+
 ```
 total_revenue | total_transactions | total_units | avg_unit_price
 ```
 
 **`daily_margin_by_category`** — from enriched silver, `_is_valid = true AND is_active = true`
+
 ```
 total_revenue | total_cost | gross_margin | margin_pct
 ```
@@ -79,7 +192,7 @@ Delta gold tables use `replaceWhere` + ZORDER. Iceberg gold tables use SQL `MERG
 A REST API (port 8000) backed by the same SparkSession as the pipeline.
 
 | Endpoint | Description |
-|---|---|
+| --- | --- |
 | `POST /ingest/transaction` | Validate and stage a new transaction to the Delta staging table |
 | `GET /sales/by-region` | Query `daily_sales_by_region` gold table with date range filter |
 | `GET /sales/by-category` | Query `daily_sales_by_category` gold table with date range filter |
@@ -130,26 +243,27 @@ open http://localhost:8000/docs
 Two CSV files simulating incremental batch loads of retail sales transactions:
 
 | File | Rows | Period |
-|---|---|---|
+| --- | --- | --- |
 | `sales_jan_mar_2024.csv` | 1,000 | Jan – Mar 2024 |
 | `sales_apr_jun_2024.csv` | 1,000 | Apr – Jun 2024 |
 
 Plus a generated products dimension file:
 
 | File | Rows | Contents |
-|---|---|---|
-| `products.parquet` | 10 | P001–P010 with supplier, cost_price, is_active |
+| --- | --- | --- |
+| `products.parquet` | 10 | P001–P010 with supplier, cost\_price, is\_active |
 
 **Known data quality issues** (handled in Silver):
-- ~2% of rows have empty `customer_id` → flagged `_is_valid = false`
-- ~1% of rows have negative `total_amount` → flagged `_is_valid = false`
+
+* ~2% of rows have empty `customer_id` → flagged `_is_valid = false`
+* ~1% of rows have negative `total_amount` → flagged `_is_valid = false`
 
 ---
 
 ## Stack
 
 | Component | Version |
-|---|---|
+| --- | --- |
 | Python | 3.11 |
 | PySpark | 3.5.0 |
 | delta-spark | 3.2.0 |
@@ -196,7 +310,7 @@ Plus a generated products dimension file:
 │   └── utils/
 │       ├── delta_utils.py            # merge_into_delta, optimize_table, vacuum_table
 │       ├── iceberg_utils.py          # iceberg_table_exists, merge_into_iceberg, optimize_iceberg_table
-│       └── schema_utils.py           # All StructType schemas (SOURCE, BRONZE, SILVER, GOLD_*, PRODUCTS, MARGIN)
+│       └── schema_utils.py           # All StructType schemas
 ├── api/
 │   ├── main.py                       # FastAPI app + lifespan SparkSession
 │   ├── dependencies.py               # get_spark() → singleton
@@ -204,16 +318,16 @@ Plus a generated products dimension file:
 │   │   ├── ingest.py                 # POST /ingest/transaction
 │   │   └── sales.py                  # GET /sales/* + GET /health
 │   └── models/
-│       └── schemas.py                # Pydantic models (TransactionIn, IngestResponse, HealthResponse)
+│       └── schemas.py                # Pydantic models
 └── tests/
-    ├── conftest.py                   # Session-scoped SparkSession fixture (Delta + Iceberg)
+    ├── conftest.py                   # Session-scoped SparkSession fixture
     ├── test_bronze.py                # (6 tests)
     ├── test_silver.py                # (6 tests)
     ├── test_gold.py                  # (6 tests)
-    ├── test_e2e_incremental.py       # (1 test) Two-batch incremental load + idempotency
-    ├── test_iceberg.py               # (12 tests) Bronze / Silver / Gold for Iceberg
-    ├── test_products.py              # (12 tests) Bronze products, silver enrichment, gold margin
-    └── test_api.py                   # (12 tests) API endpoints (validation, query, health)
+    ├── test_e2e_incremental.py       # (1 test)
+    ├── test_iceberg.py               # (12 tests)
+    ├── test_products.py              # (12 tests)
+    └── test_api.py                   # (12 tests)
 ```
 
 ---
@@ -243,61 +357,16 @@ docker compose exec spark-master pytest tests/ -v
 open http://localhost:8000/docs
 ```
 
-Expected pipeline output:
-```
-============================================================
-Retail Pipeline — Delta + Iceberg parallel run
-============================================================
-
---- Delta Lake ---
-
-[1/8] Products ingestion (Delta) ...
-      Done — 10 product rows in 6.1s
-
-[2/8] Bronze ingestion — CSV + staging (Delta) ...
-      Done — 2,000 rows in 3.1s
-
-[3/8] Silver transformation (Delta) ...
-      Done — read 2,000, merged 2,000 rows in 5.8s
-
-[4/8] Silver enrichment with products (Delta) ...
-      Done — 2,000 enriched rows in 4.4s
-
-[5/8] Gold aggregation — region + category (Delta) ...
-      Done — region + category written in 17.5s
-
-[6/8] Gold aggregation — margin by category (Delta) ...
-      Done — margin table written in 8.4s
-
---- Apache Iceberg ---
-
-[7/8] Bronze ingestion (Iceberg) ...
-      Done — 2,000 rows in 1.2s
-
-[8/8] Silver + Gold aggregation (Iceberg) ...
-      Done — silver merged 2,000 rows, gold written in 7.8s
-
-============================================================
-Pipeline complete.
-  Products        — 10 rows
-  Delta bronze    — 2,000 rows  |  silver merged: 2,000
-  Enriched silver — 2,000 rows
-  Iceberg bronze  — 2,000 rows  |  silver merged: 2,000
-============================================================
-```
-
-The pipeline is **idempotent**: re-running appends to bronze, but the silver MERGE deduplicates on `transaction_id` and gold writes overwrite only the affected date partitions.
-
 ---
 
 ## Ad-hoc SQL with Trino
 
 After running the pipeline, Iceberg gold tables are queryable via Trino at `localhost:8080`:
 
-```bash
+```sql
 docker compose exec trino trino
 
-# Inside the CLI:
+-- Inside the CLI:
 SHOW TABLES FROM iceberg.retail;
 
 SELECT * FROM iceberg.retail.gold_daily_sales_by_region
@@ -312,13 +381,11 @@ FROM iceberg.retail.gold_daily_sales_by_category
 GROUP BY category ORDER BY revenue DESC;
 ```
 
-`iceberg-rest` acts as a REST catalog bridge over the Hadoop-catalog warehouse. Trino discovers tables written by Spark automatically — no registration step is needed.
-
 ---
 
 ## Tests
 
-58 tests covering all layers in both formats, plus API and product dimension tests.
+55 tests covering all layers in both formats, plus API and product dimension tests.
 
 ```
 test_bronze.py          (6 tests)  — metadata columns, null checks, row counts, Delta write/read
@@ -327,45 +394,41 @@ test_gold.py            (6 tests)  — aggregation correctness, valid-row filter
 test_e2e_incremental.py (1 test)   — two-batch incremental load + idempotency across all layers
 test_iceberg.py         (12 tests) — Bronze write/append, Silver validation/dedup/MERGE, Gold aggregation/upsert
 test_products.py        (12 tests) — Bronze products ingestion, silver enrichment join, gold margin calculation
-test_api.py             (12 tests) — POST validation, GET endpoints, health check (monkeypatched gold paths)
+test_api.py             (12 tests) — POST validation, GET endpoints, health check
 ```
-
-The e2e test proves the following guarantees with known data:
-
-| State | Bronze | Silver | Gold |
-|---|---|---|---|
-| After load 1 (4 rows, Jan) | 4 | 4 | Jan partitions only |
-| After load 2 (3 new rows, Feb) | 7 | 7 | Jan unchanged + Feb added |
-| After re-run of load 2 | 10 | **7** (MERGE deduplicates) | **identical to above** |
 
 ```bash
 docker compose exec spark-master pytest tests/ -v --tb=short
-# 58 passed in ~2m
 ```
 
 ---
 
 ## Key Design Decisions
 
-- **`configure_spark_with_delta_pip(extra_packages=[...])`** — required when using pip-installed `delta-spark` to put Delta JARs on the classpath. The `extra_packages` argument pulls the Iceberg runtime JAR from Maven at the same time, so no Dockerfile change is needed.
-- **Named Iceberg catalog** — `spark_catalog` is claimed by `DeltaCatalog`. Iceberg runs in a separate named catalog (`iceberg`, hadoop type); tables referenced as `iceberg.retail.<name>`.
-- **Explicit `StructType` everywhere** — `inferSchema=True` is never used; all schemas live in `schema_utils.py`. The API writes staging rows as typed tuples with `SOURCE_SCHEMA` to prevent `LongType` / `IntegerType` mismatches.
-- **FastAPI lifespan SparkSession** — Spark is initialised once at startup via a `lifespan` context manager; `get_spark_session()` returns the same singleton for every request.
-- **Staging table union** — `ingest_bronze()` checks whether a staging Delta table exists and unions it with the CSV source before adding metadata. No source modification required.
-- **API tests use monkeypatching** — route handlers access paths via `import src.config as config; config.GOLD_REGION_PATH` (dot-access, not destructured imports), so `monkeypatch.setattr(config, ...)` works at call time with `tmp_path` Delta tables.
-- **`replaceWhere` for Delta gold; SQL MERGE for Iceberg gold** — `replaceWhere` is a Delta-only API. Iceberg achieves the same partition-safe update via `MERGE INTO` with composite keys.
-- **Singleton SparkSession** — guarded by a module-level `_spark = None` pattern in `config.py`; tests use their own fixture-scoped session from `conftest.py`.
+* **`configure_spark_with_delta_pip`** — required when using pip-installed `delta-spark` to put Delta JARs on the classpath. The `extra_packages` argument pulls the Iceberg runtime JAR from Maven at the same time.
+* **Named Iceberg catalog** — `spark_catalog` is claimed by `DeltaCatalog`. Iceberg runs in a separate named catalog (`iceberg`, hadoop type); tables referenced as `iceberg.retail.<name>`.
+* **Explicit `StructType` everywhere** — `inferSchema=True` is never used; all schemas live in `schema_utils.py`.
+* **FastAPI lifespan SparkSession** — Spark is initialised once at startup; `get_spark_session()` returns the same singleton for every request.
+* **Staging table union** — `ingest_bronze()` checks whether a staging Delta table exists and unions it with the CSV source before adding metadata.
+* **API tests use monkeypatching** — route handlers access paths via `import src.config as config; config.GOLD_REGION_PATH` so `monkeypatch.setattr(config, ...)` works at call time with `tmp_path` Delta tables.
+* **`replaceWhere` for Delta gold; SQL MERGE for Iceberg gold** — `replaceWhere` is a Delta-only API. Iceberg achieves the same partition-safe update via `MERGE INTO` with composite keys.
 
 ---
 
 ## Extending This Project
 
-- **Cloud storage** — swap local paths in `src/config.py` for `abfss://` (ADLS) or `s3a://` (S3); change the Iceberg catalog type from `hadoop` to `glue` or `hive`
-- **Databricks** — the PySpark + Delta code runs as-is; replace the SparkSession factory with `DatabricksSession.builder.getOrCreate()` and use Unity Catalog for Iceberg
-- **Orchestration** — wrap each layer in an Airflow DAG or Databricks Workflow task
-- **Streaming** — replace `spark.read.csv()` in bronze with `spark.readStream` for near-real-time ingestion
-- **SCD Type 2** — extend the silver MERGE to track row history instead of overwriting matched rows
-- **BI / dashboards** — connect any JDBC-compatible tool (DBeaver, Metabase, Superset) to Trino at `localhost:8080`
+* **Cloud storage** — swap local paths in `src/config.py` for `abfss://` (ADLS) or `s3a://` (S3)
+* **Databricks** — replace the SparkSession factory with `DatabricksSession.builder.getOrCreate()` and use Unity Catalog for Iceberg
+* **Orchestration** — wrap each layer in an Airflow DAG or Databricks Workflow task
+* **Streaming** — replace `spark.read.csv()` in bronze with `spark.readStream` for near-real-time ingestion
+* **SCD Type 2** — extend the silver MERGE to track row history instead of overwriting matched rows
+* **BI / dashboards** — connect any JDBC-compatible tool (DBeaver, Metabase, Superset) to Trino at `localhost:8080`
+
+---
+
+## About This Project
+
+This project came out of wanting to consolidate and demonstrate a range of modern data engineering patterns in a single working codebase — medallion architecture, open table formats, a REST ingestion layer, and ad-hoc SQL, all running locally in Docker. I designed the architecture, defined the layer specifications and schema decisions, and tested and validated the output throughout. Claude Code in agentic mode handled the implementation, which let me stay focused on the design, the technical tradeoffs, and making sure everything actually worked end to end.
 
 ---
 
